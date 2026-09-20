@@ -89,6 +89,11 @@ const (
 	ActionTypeWait            ActionType = "wait"
 	ActionTypeRedirect        ActionType = "redirect"
 	ActionTypeSubRequest      ActionType = "sub_request"
+	ActionTypeClick           ActionType = "click"
+	ActionTypeNavigate        ActionType = "navigate"
+	ActionTypeWaitVisible     ActionType = "wait_visible"
+	ActionTypeWaitHidden      ActionType = "wait_hidden"
+	ActionTypeKeyPress        ActionType = "key_press"
 )
 
 func ActionFromEventListener(listener *EventListener) *Action {
