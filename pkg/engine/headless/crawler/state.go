@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -314,7 +315,7 @@ func (c *Crawler) tryShortestPathNavigation(action *types.Action, page *browser.
 		slog.Any("actions", actions),
 	)
 	for _, action := range actions {
-		if err := c.executeCrawlStateAction(action, page); err != nil {
+		if err := c.executeCrawlStateAction(context.Background(), action, page); err != nil {
 			return "", err
 		}
 	}

@@ -70,6 +70,9 @@ type ActionType string
 const (
 	ActionTypeUnknown         ActionType = "unknown"
 	ActionTypeLoadURL         ActionType = "load_url"
+	// ActionTypeNavigate is an in-session navigation to an explicit URL
+	// (distinct from ActionTypeLoadURL, which is the top-level initial load).
+	ActionTypeNavigate        ActionType = "navigate"
 	ActionTypeExecuteJS       ActionType = "execute_js"
 	ActionTypeLeftClick       ActionType = "left_click"
 	ActionTypeLeftClickDown   ActionType = "left_click_down"
@@ -77,6 +80,8 @@ const (
 	ActionTypeRightClick      ActionType = "right_click"
 	ActionTypeDoubleClick     ActionType = "double_click"
 	ActionTypeScroll          ActionType = "scroll"
+	// ActionTypeClick is the generic pointer click action.
+	ActionTypeClick           ActionType = "click"
 	ActionTypeSendKeys        ActionType = "send_keys"
 	ActionTypeKeyUp           ActionType = "key_up"
 	ActionTypeKeyDown         ActionType = "key_down"
@@ -87,6 +92,12 @@ const (
 	ActionTypeMouseWheel      ActionType = "mouse_wheel"
 	ActionTypeFillForm        ActionType = "fill_form"
 	ActionTypeWait            ActionType = "wait"
+	// ActionTypeWaitVisible blocks until the action element becomes visible.
+	ActionTypeWaitVisible     ActionType = "wait_visible"
+	// ActionTypeWaitHidden blocks until the action element becomes hidden.
+	ActionTypeWaitHidden      ActionType = "wait_hidden"
+	// ActionTypeKeyPress presses one key or a chord (e.g. "Control+Enter").
+	ActionTypeKeyPress        ActionType = "key_press"
 	ActionTypeRedirect        ActionType = "redirect"
 	ActionTypeSubRequest      ActionType = "sub_request"
 )

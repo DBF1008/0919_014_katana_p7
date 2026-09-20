@@ -18,7 +18,6 @@ import (
 	"github.com/go-rod/rod/lib/utils"
 	"github.com/happyhackingspace/dit"
 	"github.com/pkg/errors"
-	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/browser"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/captcha"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/crawler/diagnostics"
@@ -35,6 +34,8 @@ type Crawler struct {
 	options       Options
 	crawlQueue    queue.Queue[*types.Action]
 	crawlGraph    *graph.CrawlGraph
+	actions       *ActionRegistry
+	crawlChain    CrawlHandler
 	simhashOracle *simhash.Oracle
 	uniqueActions map[string]struct{}
 	diagnostics   diagnostics.Writer
@@ -152,10 +153,15 @@ func New(opts Options) (*Crawler, error) {
 		launcher:      launcher,
 		options:       opts,
 		logger:        opts.Logger,
+		actions:       NewActionRegistry(),
 		uniqueActions: make(map[string]struct{}),
 		diagnostics:   diagnosticsWriter,
 		simhashOracle: simhash.NewOracle(),
 	}
+	crawler.crawlChain = BuildCrawlChain(
+		func(*CrawlStep) error { return nil },
+		crawler.defaultCrawlMiddlewares()...,
+	)
 	return crawler, nil
 }
 
@@ -324,234 +330,26 @@ func (c *Crawler) Crawl(URL string) error {
 	}
 }
 
-var ErrNoCrawlingAction = errors.New("no more actions to crawl")
-
 func (c *Crawler) crawlFn(ctx context.Context, action *types.Action, page *browser.BrowserPage) error {
 	defer func() {
 		c.launcher.PutBrowserToPool(page)
 	}()
 
-	currentPageHash, _, err := getPageHash(page)
-	if err != nil {
-		return err
-	}
-
-	c.logger.Debug("Processing action - current state",
-		slog.String("current_page_hash", currentPageHash),
-		slog.String("action_origin_id", action.OriginID),
-		slog.String("action", action.String()),
-	)
-
-	if action.OriginID != "" && action.OriginID != currentPageHash {
-		c.logger.Debug("Need to navigate back to origin",
-			slog.String("from", currentPageHash),
-			slog.String("to", action.OriginID),
-		)
-		newPageHash, err := c.navigateBackToStateOrigin(action, page, currentPageHash)
-		if err != nil {
-			return err
-		}
-		// Refresh the page hash
-		currentPageHash = newPageHash
-	}
-
-	// FIXME: TODO: Restrict the navigation using scope manager and only
-	// proceed with actions if the scope is allowed
-
-	// Check the action and do actions based on action type
-	if c.diagnostics != nil {
-		if err := c.diagnostics.LogAction(action); err != nil {
-			return err
-		}
-	}
-	if err := c.executeCrawlStateAction(action, page); err != nil {
-		return err
-	}
-
-	// Check for captcha pages after navigation and attempt to solve them.
-	// On success, wait for the page to settle and re-enter crawlFn so navigation
-	// discovery runs on the post-solve page instead of the captcha page.
-	if c.options.CaptchaHandler != nil {
-		html, htmlErr := page.HTML()
-		if htmlErr == nil {
-			handled, solveErr := c.options.CaptchaHandler.HandleIfCaptcha(ctx, page.Page, html)
-			if solveErr != nil {
-				gologger.Warning().Msgf("captcha solving failed: %s", solveErr)
-			}
-			if handled && solveErr == nil {
-				_ = page.WaitPageLoadHeurisitics()
-			}
-			if handled {
-				// Skip navigation discovery on captcha pages — the discovered
-				// links/forms belong to the captcha widget, not the real page.
-				return nil
-			}
-		}
-	}
-
-	if !c.loggedIn && c.options.AuthUsername != "" && c.options.DitClassifier != nil {
-		if info, err := page.Info(); err == nil && (c.options.ScopeValidator == nil || c.options.ScopeValidator(info.URL)) {
-			if html, htmlErr := page.HTML(); htmlErr == nil {
-				if c.tryAutoLogin(page, html) {
-					_ = page.WaitPageLoadHeurisitics()
-				}
-			}
-		}
-	}
-
-	pageState, err := newPageState(page, action)
-	if err != nil {
-		return err
-	}
-	if c.diagnostics != nil {
-		if err := c.diagnostics.LogPageState(pageState, diagnostics.PostActionPageState); err != nil {
-			return err
-		}
-	}
-	pageState.OriginID = currentPageHash
-
-	if c.options.ScopeValidator != nil {
-		if !c.options.ScopeValidator(pageState.URL) {
-			c.logger.Debug("Skipping navigation collection - current page is out of scope",
-				slog.String("url", pageState.URL),
-			)
-			if c.crawlQueue.Size() == 0 {
-				return ErrNoCrawlingAction
-			}
-			return nil
-		}
-	}
-
-	navigations, err := page.FindNavigations()
-	if err != nil {
-		return err
-	}
-
-	// Log navigations for diagnostics
-	if c.diagnostics != nil {
-		screenshotState, err := page.Screenshot(false, &proto.PageCaptureScreenshot{
-			Format: proto.PageCaptureScreenshotFormatPng,
-		})
-		if err != nil {
-			c.logger.Error("Failed to take screenshot", slog.String("error", err.Error()))
-		}
-		if err := c.diagnostics.LogPageStateScreenshot(pageState.UniqueID, screenshotState); err != nil {
-			c.logger.Error("Failed to log page state screenshot", slog.String("error", err.Error()))
-		}
-		if err := c.diagnostics.LogNavigations(pageState.UniqueID, navigations); err != nil {
-			c.logger.Error("Failed to log navigations", slog.String("error", err.Error()))
-		}
-	}
-
-	for _, nav := range navigations {
-		actionHash := nav.Hash()
-		if _, ok := c.uniqueActions[actionHash]; ok {
-			continue
-		}
-		c.uniqueActions[actionHash] = struct{}{}
-
-		// Check if the element we have is a logout page
-		if nav.Element != nil && isLogoutPage(nav.Element) {
-			c.logger.Debug("Skipping Found logout page",
-				slog.String("url", nav.Element.Attributes["href"]),
-			)
-			continue
-		}
-		nav.OriginID = pageState.UniqueID
-
-		c.logger.Debug("Got new navigation",
-			slog.Any("navigation", nav),
-		)
-		if err := c.crawlQueue.Offer(nav); err != nil {
-			return err
-		}
-	}
-
-	err = c.crawlGraph.AddPageState(*pageState)
-	if err != nil {
-		return err
-	}
-
-	// TODO: Check if the page opened new sub pages and if so capture their
-	// navigation as well as close them so the state change can work.
-
-	if len(navigations) == 0 && c.crawlQueue.Size() == 0 {
-		return ErrNoCrawlingAction
-	}
-	return nil
-}
-
-var ErrElementNotVisible = errors.New("element not visible")
-
-func (c *Crawler) executeCrawlStateAction(action *types.Action, page *browser.BrowserPage) error {
-	return runWithActionHooks(c.options.Hooks, page, action, func() error {
-		return c.dispatchCrawlAction(action, page)
+	return c.crawlChain(&CrawlStep{
+		Ctx:    ctx,
+		Action: action,
+		Page:   page,
 	})
 }
 
-func (c *Crawler) dispatchCrawlAction(action *types.Action, page *browser.BrowserPage) error {
-	var err error
-	switch action.Type {
-	case types.ActionTypeLoadURL:
-		// Apply a timeout to every critical Rod call.
-		pTimeout := page.Timeout(c.options.PageMaxTimeout)
+var ErrNoCrawlingAction = errors.New("no more actions to crawl")
 
-		if err := pTimeout.Navigate(action.Input); err != nil {
-			return err
-		}
-		if err = page.WaitPageLoadHeurisitics(); err != nil {
-			return err
-		}
-	case types.ActionTypeFillForm:
-		if err := c.processForm(page, action.Form); err != nil {
-			return err
-		}
-		if err = page.WaitPageLoadHeurisitics(); err != nil {
-			return err
-		}
-	case types.ActionTypeLeftClick, types.ActionTypeLeftClickDown:
-		pTimeout := page.Timeout(c.options.PageMaxTimeout)
-		element, err := pTimeout.ElementX(action.Element.XPath)
-		if err != nil {
-			return err
-		}
-
-		elementTimeout := element.Timeout(c.options.PageMaxTimeout)
-		if err := elementTimeout.ScrollIntoView(); err != nil {
-			return err
-		}
-		visible, err := element.Visible()
-		if err != nil {
-			return err
-		}
-		if !visible {
-			return ErrElementNotVisible
-		}
-
-		// Check if element is interactable (not blocked by overlays)
-		interactable, err := element.Interactable()
-		if err != nil {
-			var ce *rod.CoveredError
-			if errors.As(err, &ce) {
-				return ErrElementNotVisible
-			}
-			return err
-		}
-		if interactable == nil {
-			return ErrElementNotVisible
-		}
-
-		if err := element.Click(proto.InputMouseButtonLeft, 1); err != nil {
-			return err
-		}
-		if err = page.WaitPageLoadHeurisitics(); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unknown action type: %v", action.Type)
-	}
-
-	return nil
+// executeCrawlStateAction runs action through the lifecycle hooks and the
+// executor registry.
+func (c *Crawler) executeCrawlStateAction(ctx context.Context, action *types.Action, page *browser.BrowserPage) error {
+	return runWithActionHooks(c.options.Hooks, page, action, func() error {
+		return c.dispatchCrawlAction(ctx, action, page)
+	})
 }
 
 func (c *Crawler) tryAutoLogin(page *browser.BrowserPage, html string) bool {
